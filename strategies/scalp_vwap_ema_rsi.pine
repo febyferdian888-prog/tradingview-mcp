@@ -1,0 +1,114 @@
+//@version=6
+// Scalping strategy for crypto on 1m-5m charts.
+// Trend filter: price vs VWAP + fast/slow EMA alignment.
+// Trigger: short-period RSI crossing back out of a pullback zone.
+// Exits: ATR stop, fixed R-multiple target, optional time stop.
+// Fees and slippage are baked into the backtest (Properties tab can override).
+strategy("Scalp VWAP + EMA + RSI [1m-5m]", shorttitle = "ScalpVER", overlay = true,
+     initial_capital = 1000,
+     default_qty_type = strategy.percent_of_equity, default_qty_value = 10,
+     commission_type = strategy.commission.percent, commission_value = 0.05,
+     slippage = 2, pyramiding = 0)
+
+// ───── Inputs ─────
+grpT = "Trend filter"
+emaFastLen  = input.int(9,  "EMA fast length", minval = 1, group = grpT)
+emaSlowLen  = input.int(21, "EMA slow length", minval = 2, group = grpT)
+vwapAnchor  = input.timeframe("D", "VWAP reset period", group = grpT)
+useSlope    = input.bool(true, "Require slow EMA slope in trade direction", group = grpT)
+
+grpR = "RSI trigger"
+rsiLen      = input.int(7, "RSI length", minval = 2, group = grpR)
+rsiLongLvl  = input.float(40, "Long: RSI crosses above", minval = 1, maxval = 99, group = grpR)
+rsiShortLvl = input.float(60, "Short: RSI crosses below", minval = 1, maxval = 99, group = grpR)
+
+grpX = "Exits"
+atrLen      = input.int(14, "ATR length", minval = 1, group = grpX)
+slMult      = input.float(1.0, "Stop = ATR x", minval = 0.1, step = 0.1, group = grpX)
+rrMult      = input.float(1.5, "Target = stop x (R multiple)", minval = 0.1, step = 0.1, group = grpX)
+maxBars     = input.int(30, "Time stop (bars, 0 = off)", minval = 0, group = grpX)
+
+grpF = "Filters"
+allowLong   = input.bool(true, "Allow longs", group = grpF)
+allowShort  = input.bool(true, "Allow shorts", group = grpF)
+useVol      = input.bool(true, "Volume above average", group = grpF)
+volLen      = input.int(20, "Volume average length", minval = 1, group = grpF)
+feePct      = input.float(0.05, "Fee per side % (match Properties > Commission)", minval = 0, step = 0.01, group = grpF)
+minFeeMult  = input.float(3.0, "Target must be >= round-trip fee x", minval = 0, step = 0.5, group = grpF)
+cooldown    = input.int(3, "Cooldown bars after a trade", minval = 0, group = grpF)
+useSession  = input.bool(false, "Trade only inside session (UTC)", group = grpF)
+sessionStr  = input.session("0700-2200", "Session (UTC)", group = grpF)
+
+// ───── Indicators ─────
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+vwap    = ta.vwap(hlc3, timeframe.change(vwapAnchor))
+rsi     = ta.rsi(close, rsiLen)
+atr     = ta.atr(atrLen)
+volAvg  = ta.sma(volume, volLen)
+
+// ───── Filters ─────
+upTrend   = close > vwap and emaFast > emaSlow and (not useSlope or emaSlow > emaSlow[1])
+downTrend = close < vwap and emaFast < emaSlow and (not useSlope or emaSlow < emaSlow[1])
+
+volOk  = not useVol or volume > volAvg
+inSess = not useSession or not na(time(timeframe.period, sessionStr, "UTC"))
+
+stopDist   = atr * slMult
+targetDist = stopDist * rrMult
+// Skip setups whose target is too small to beat entry + exit fees.
+feeOk = targetDist / close * 100 >= 2 * feePct * minFeeMult
+
+lastExitBar = strategy.closedtrades > 0 ? strategy.closedtrades.exit_bar_index(strategy.closedtrades - 1) : na
+cooldownOk  = na(lastExitBar) or bar_index - lastExitBar >= cooldown
+
+// Computed every bar: v6 evaluates `and` lazily, so ta.* calls inside it would skip bars.
+rsiUp   = ta.crossover(rsi, rsiLongLvl)
+rsiDown = ta.crossunder(rsi, rsiShortLvl)
+
+flat    = strategy.position_size == 0
+common  = flat and volOk and inSess and feeOk and cooldownOk and barstate.isconfirmed
+
+longSignal  = allowLong  and common and upTrend   and rsiUp
+shortSignal = allowShort and common and downTrend and rsiDown
+
+// ───── Orders ─────
+var float slPrice = na
+var float tpPrice = na
+
+if longSignal
+    slPrice := close - stopDist
+    tpPrice := close + targetDist
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long X", "Long", stop = slPrice, limit = tpPrice)
+    alert('{"side":"buy","symbol":"' + syminfo.ticker + '","sl":' + str.tostring(slPrice) + ',"tp":' + str.tostring(tpPrice) + '}', alert.freq_once_per_bar_close)
+
+if shortSignal
+    slPrice := close + stopDist
+    tpPrice := close - targetDist
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short X", "Short", stop = slPrice, limit = tpPrice)
+    alert('{"side":"sell","symbol":"' + syminfo.ticker + '","sl":' + str.tostring(slPrice) + ',"tp":' + str.tostring(tpPrice) + '}', alert.freq_once_per_bar_close)
+
+// Time stop: scalps that go nowhere get closed.
+if maxBars > 0 and strategy.opentrades > 0
+    if bar_index - strategy.opentrades.entry_bar_index(0) >= maxBars
+        strategy.close_all(comment = "Time stop")
+
+if strategy.position_size == 0 and not longSignal and not shortSignal
+    slPrice := na
+    tpPrice := na
+
+// ───── Plots ─────
+plot(vwap,    "VWAP",     color = color.orange, linewidth = 2)
+plot(emaFast, "EMA fast", color = color.teal)
+plot(emaSlow, "EMA slow", color = color.purple)
+plot(slPrice, "Stop",   color = color.red,   style = plot.style_linebr)
+plot(tpPrice, "Target", color = color.green, style = plot.style_linebr)
+
+bgcolor(upTrend ? color.new(color.green, 92) : downTrend ? color.new(color.red, 92) : na, title = "Trend background")
+plotshape(longSignal,  "Long signal",  shape.triangleup,   location.belowbar, color.green, size = size.tiny)
+plotshape(shortSignal, "Short signal", shape.triangledown, location.abovebar, color.red,   size = size.tiny)
+
+if barstate.islast and timeframe.in_seconds() > 300
+    label.new(bar_index, high, "Built for 1m-5m charts", style = label.style_label_down, color = color.yellow, textcolor = color.black)
